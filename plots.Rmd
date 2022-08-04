@@ -1,0 +1,405 @@
+---
+title: "Epigenomics Case Study"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction 
+
+This case study is based on data downloaded from GEO ([GSE181064](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE181064)). It consists of scATAC-seq and scRNA-seq data from patients with renal cell carcinoma (RCC). The cells were sorted prior to sequencing so only CD45+ cells are included and for each patient there is a sample from tumour tissue, adjacent normal tissue (adjNorm) and peripheral blood mononuclear cells (PBMCs) (for scRNA-seq there was 2 replicates of each sample). For the purpose of this analysis, I focused on data from one patient (pt_1002300) and analysed just the tumour and adjacent normal tissue samples. The study was [recently published in Nature Cancer](https://www.nature.com/articles/s43018-022-00391-0).
+
+```{r, load_libraries, include = F}
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(patchwork)
+library(ggrepel)
+library(ggtext)
+library(clusterProfiler)
+library(gt)
+library(gtExtras)
+library(org.Hs.eg.db)
+library(ggalluvial)
+```
+
+
+The scATAC-seq data has already been through quality control to remove poor quality cells (as described in the paper). The data consists of 4,843 immune cells - 3,179 from tumour tissue and 1,664 from adjacent normal tissue. MACS3 was used to perform peak calling on the scATAC-seq fragments and identified 157,131 peaks.
+
+
+```{r, load_atac}
+# Read in scATAC-seq data
+atac <- readRDS('tum_norm_integrated_atac.Rds')
+atac
+```
+
+UMAP was used to reduce the dimensionality of the dataset and visualise the cells. Cells were clustered based on their chromatin accessibility using the Leiden community detection algorithm which detected 10 clusters with distinct chromatin accessibility profiles. To classify each cluster, chromatin accessibility was used to predict gene activity scores and for each cluster, the genes with the top activity scores were used to identify the cell type.
+
+```{r, atac_umap, warning=FALSE, fig.width=12, fig.height=5}
+# set up dataframe
+umap_df <- cbind(as.data.frame(Embeddings(atac, reduction = 'umap')), as.data.frame(atac@meta.data))
+
+# set up colour palettes
+tissue_cols <- c(RCC = '#7D1E5A', adjNorm = '#FD2F21')
+cluster_cols <- c("#5DA5DAFF", "#FAA43AFF", "#60BD68FF", "#F15854FF", "#B276B2FF", "#8D4B08FF", "#DECF3FFF", "#F17CB0FF", "#66E3D9FF", "#00FF7FFF")
+names(cluster_cols) <- levels(atac$cluster)
+
+# set up umap arrows
+umap_arrows <- ggplot(data.frame(x = 100, y = 100), aes(x=x,y=y)) +
+  geom_point()+
+  xlim(c(0,10)) + ylim(c(0,10)) +
+  theme_classic() +
+  ylab('UMAP2') + xlab('UMAP1') +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_line(arrow = arrow(angle = 15, length = unit(.5, 'cm'), type = 'closed'))
+  )
+
+# tissue umap
+tissue_plot <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, col = sampletype)) +
+  geom_point(size = 0.5, show.legend = T) +
+  scale_colour_manual(values = tissue_cols, name = NULL) +
+  labs(title = 'Tissue') +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  theme_void() +
+  theme(legend.position = c(0.12, 0.925),
+        legend.direction = 'horizontal')
+
+layout <- c(
+  area(t=1, l=2, b = 11, r=11),
+  area(t=10, l=1, b=12, r=2)
+)
+
+tissue_umap <- tissue_plot + umap_arrows + plot_layout(design = layout)
+
+# cluster umap
+cluster_umap <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, col = cluster)) +
+  geom_point(size = 0.5, show.legend = F) +
+  geom_label_repel(data = umap_df %>% group_by(cluster) %>% summarise(x = median(UMAP_1), y = median(UMAP_2)), aes(x=x, y=y, label = cluster), nudge_y = -1, show.legend = F, fill = alpha('#ffffff', 0.8), fontface = 'bold') +
+  scale_colour_manual(values = cluster_cols) +
+  labs(title = 'Cluster') +
+  theme_void()
+
+# cluster proportions
+prop_plot <- ggplot(umap_df, aes(y = cluster, fill = sampletype)) +
+  geom_bar(position = 'fill') +
+  scale_fill_manual(values = tissue_cols) +
+  scale_y_discrete(limits = rev(levels(atac$cluster))) +
+  scale_x_continuous(expand = c(0,0), position = 'top') +
+  labs(title = 'Proportion', x = NULL, y = 'Cluster', fill = 'Tissue') +
+  theme_classic() +
+  theme(axis.text = element_text(colour = 'black'),
+        legend.position = 'bottom',
+        plot.title = element_text(hjust = 0.5))
+
+
+(tissue_umap | cluster_umap | prop_plot) + plot_layout(widths = c(0.4,0.4,0.2))
+```
+
+
+```{r, activity_heatmap, fig.width=12, fig.height=6}
+DefaultAssay(atac) <- 'ACTIVITY'
+Idents(atac) <- atac$cluster
+
+degs <- FindAllMarkers(atac)
+top_genes <- degs %>% filter(avg_log2FC >= 1, p_val_adj <= 0.05, pct.1 >= 0.5)
+
+go_clusters <- compareCluster(unstack(top_genes, form = 'gene ~ cluster'), fun = 'enrichGO', OrgDb = org.Hs.eg.db, keyType = 'SYMBOL', ont = "BP")
+
+
+avg_exp <- AverageExpression(atac, return.seurat=TRUE, verbose = F)
+
+hmap_df <- avg_exp@assays$ACTIVITY@scale.data[unique(top_genes$gene),] %>% as.data.frame() %>% rownames_to_column(var = 'gene') %>% pivot_longer(-gene, names_to = 'cluster', values_to = 'value')
+
+brks <- c('KLRF1', 'GNLY', 'CTLA4', 'CD27', 'IL7R', 'CD8B', 'CSF1R', 'TREM1', 'KIR2DL4', 'MEIS2', 'ROBO4', 'MS4A1', 'FOXP3')
+
+labs <- paste0('<span style=color:', cluster_cols, '>', 1:10, '</span>')
+names(labs) <- names(cluster_cols)
+
+p1 <- 
+  ggplot(hmap_df %>% mutate(cluster = factor(cluster, levels = names(cluster_cols))), aes(y = cluster, x = gene, fill = value)) +
+  geom_raster() +
+  scale_x_discrete(limits = unique(top_genes$gene), position = 'top', breaks = brks) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_fill_gradientn(colours = Seurat:::PurpleAndYellow(100), name = 'Activity\nscore') +
+  facet_grid(cluster~., scales = 'free_y', labeller = labeller(cluster = labs)) +
+  theme_classic() +
+  theme(axis.text.x.top = element_text(angle = 90, hjust = 0, vjust = 0.5, colour = 'black', size = 8),
+        axis.title = element_blank(),
+        legend.position = 'left',
+        panel.spacing.y = unit(0.1, 'lines'),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text.y = element_markdown(angle = 0, face = 'bold', size = 12))
+
+
+p2 <- ggplot(go_clusters  %>% as.data.frame() %>% filter(qvalue <= 0.05) %>% group_by(Cluster) %>% slice_min(order_by = qvalue, n = 3, with_ties = F) %>% mutate(Cluster = factor(Cluster, levels = 1:10), Description = fct_reorder(Description, -qvalue)), aes(y = Description, x = -log10(qvalue), fill = Cluster)) +
+  geom_col(show.legend = F, alpha = 0.8) +
+  geom_text(aes(label = Description, x = 0.25), hjust = 0) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = unname(cluster_cols[c(1:4, 7:10)])) +
+  facet_grid(Cluster~., scales = 'free', drop = F, switch = 'y') +
+  labs(y = NULL) +
+  theme_classic() +
+  theme(strip.placement = 'outside',
+        axis.text = element_text(colour = 'black'),
+        strip.background = element_blank(),
+        strip.text = element_text(colour = 'white'),
+        panel.spacing.y = unit(0.1, 'lines'),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  coord_cartesian(clip = 'off')
+
+(p1 | p2) + plot_layout(widths = c(1.25,0.75))
+```
+
+
+```{r, homer_results}
+DefaultAssay(atac) <- 'peaks'
+Idents(atac) <- atac$cluster
+
+daps <- FindAllMarkers(atac) # find differentially accessible peaks for each cluster
+cluster_bed <- daps %>% group_by(cell_type) %>% filter(adj_p <= 0.05, abs(avg_logFC) >= 0.5, pct.1 > 0.5) %>% dplyr::select(cell_type, gene)
+
+# write out bed files of da peaks for each cluster
+for(i in unique(cluster$cell_type)){
+  sub <- cluster %>% filter(cell_type == i) %>% ungroup() %>% dplyr::select(-cell_type) %>% separate(gene, into = c('chr', 'start', 'end'), sep = '-') %>% mutate(peak_id = 1:nrow(.), col5 = '', strand = 0)
+  write.table(sub, file = paste0('cluster_beds/', str_replace_all(i, ' ', '_'), '.bed'), sep = '\t', col.names = F, row.names = F, quote = F)
+}
+
+# run homer using run_homer.sh script to find enriched motifs for each cluster
+
+# plot homer results
+df <- data.frame()
+for(i in c(1:5, 7:10)){
+  img_path <- paste0("cluster/cluster_", i, "/homerResults/motif1.png")
+  motif  <- scan(paste0("cluster/cluster_", i, "/homerResults/motif1.motif"), character(), quote = "")
+  df_img <- data.frame(cluster = c(labs[i]),
+                     image = c(img_path),
+                     best_match = str_extract(motif[2], 'BestGuess:[^\\s]+') %>% str_extract('[^/]+') %>% str_extract('[^:]+$'),
+                     p = str_extract(motif[6], '[0-9]+$') %>% as.numeric()) 
+  df <- rbind(df, df_img)
+   }
+
+motif_tab <- df %>% dplyr::select(Cluster = cluster, `Top enriched motif` = image, `Best match` = best_match, `-log10 (p value)` = p) %>% gt() %>% gt_img_rows(columns = `Top enriched motif`, height = 25, img_source = 'local') %>%
+  cols_align(
+    align = "left",
+    columns = Cluster
+  ) %>%
+  cols_align(
+    align = "center",
+    columns = c(`Top enriched motif`, `Best match`)
+  ) %>% fmt_markdown(columns = Cluster) %>%
+  tab_style(style = cell_text(weight = 'bold'), locations = cells_body(
+      columns = Cluster)) %>%
+  data_color(
+    columns = `-log10 (p value)`,
+    colors = scales::col_numeric(
+      palette = c("#FFEBEE80", "#FFCDD280", "#EF9A9A80", "#E5737380", "#EF535080", "#F4433680", "#E5393580", "#D32F2F80", "#C6282880", "#B71C1C80"),
+      domain = NULL
+    )
+  )
+
+gtsave(motif_tab, 'motif_tab.png')
+```
+
+
+```{r, rna_seq}
+rna <- readRDS('tumour_norm_scRNA_labelled.Rds')
+
+umap_df <- cbind(as.data.frame(Embeddings(rna, reduction = 'umap')), as.data.frame(rna@meta.data))
+
+umap_df$tissue <- factor(umap_df$tissue, levels = c('kidney', 'tumor'), labels = c('adjNorm', 'RCC'))
+
+# set up colour palettes
+cell_cols <- c(`B cells` = '#fcba03', `CD14 monocytes` = '#b2ef9b', `CD16 monocytes` = '#3a7219', `Dendritic cells` = '#f7a660', `NK cells` = '#bd0000', `NKT cells` = '#4D1282', `CD8 memory T cells` = '#946cd5', `CD8 naive T cells` = '#96cbfe', `CD4 T cells` = '#16b8b2', `Regulatory T cells` = '#015073')
+
+# tissue umap
+tissue_plot <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, col = tissue)) +
+  geom_point(size = 0.25, show.legend = T) +
+  scale_colour_manual(values = tissue_cols, name = NULL) +
+  labs(title = 'Tissue') +
+  guides(colour = guide_legend(override.aes = list(size = 3))) +
+  theme_void() +
+  theme(legend.position = c(0.12, 0.925),
+        legend.direction = 'horizontal')
+
+
+tissue_umap <- tissue_plot + umap_arrows + plot_layout(design = layout)
+
+# celltype umap
+celltype_umap <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, col = cell_type)) +
+  geom_point(size = 0.25, show.legend = F) +
+  geom_label_repel(data = umap_df %>% group_by(cell_type) %>% summarise(x = median(UMAP_1), y = median(UMAP_2)), aes(x=x, y=y, label = cell_type), nudge_y = -1, show.legend = F, fill = alpha('#ffffff', 0.8), fontface = 'bold') +
+  scale_colour_manual(values = cell_cols) +
+  labs(title = 'Cell type') +
+  theme_void()
+
+# cluster proportions
+prop_plot <- ggplot(umap_df, aes(y = cell_type, fill = tissue)) +
+  geom_bar(position = 'fill') +
+  scale_fill_manual(values = tissue_cols) +
+  scale_y_discrete(limits = rev(names(cell_cols))) +
+  scale_x_continuous(expand = c(0,0), position = 'top') +
+  labs(title = 'Proportion', x = NULL, y = 'Cell type', fill = 'Tissue') +
+  theme_classic() +
+  theme(axis.text = element_text(colour = 'black'),
+        legend.position = 'bottom',
+        plot.title = element_text(hjust = 0.5))
+
+
+(tissue_umap | celltype_umap | prop_plot) + plot_layout(widths = c(0.4,0.4,0.2))
+
+```
+
+```{r}
+DotPlot(rna, features = c('MS4A1', 'S100A8', 'CST3', 'FCGR3A', 'FCER1A', 'NKG7', 'KLRB1', 'GNLY', 'CCL5', 'CD3E', 'CD8A', 'IL7R', 'CD4', 'CTLA4', 'FOXP3'), group.by = 'cell_type', assay = 'RNA') +
+  scale_y_discrete(limits = rev(names(cell_cols)), name = NULL) +
+  scale_colour_gradientn(colours = c("#F6F6FCFF", "#E5E1F0FF", "#D9C6E6FF", "#D5A6DBFF", "#D981CBFF", "#DE51B3FF", "#DD008FFF", "#C7005AFF", "#930021FF", "#611300FF")) +
+  theme(axis.text.x = element_text(angle = 44, hjust = 1))
+```
+
+```{r, rna_atac}
+umap_df <- cbind(as.data.frame(Embeddings(atac, reduction = 'umap')), as.data.frame(atac@meta.data))
+
+ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, col = predicted.id)) +
+  geom_point(size = 0.5, show.legend = F) +
+  geom_label_repel(data = umap_df %>% group_by(predicted.id) %>% summarise(x = median(UMAP_1), y = median(UMAP_2)), aes(x=x, y=y, label = predicted.id), nudge_y = -1, show.legend = F, fill = alpha('#ffffff', 0.8), fontface = 'bold') +
+  scale_colour_manual(values = cell_cols) +
+  labs(title = 'Predicted cell type') +
+  theme_void()
+
+
+sank_df <- umap_df %>% dplyr::select(predicted.id, cluster) %>%
+  group_by(predicted.id, cluster) %>% tally()
+
+annotation_df_left <- umap_df %>% group_by(cluster) %>% tally() %>% mutate(cluster = factor(cluster, levels = rev(names(cluster_cols)))) %>% arrange(cluster) %>% ungroup() %>% mutate(cumfreq = cumsum(n)) 
+
+cluster_ys <- c()
+j <- 0
+for(i in 1:nrow(annotation_df_left)){
+  cluster_ys <- c(cluster_ys, (j + annotation_df_left$cumfreq[i])/2)
+  j <- j + annotation_df_left$n[i]
+}
+
+annotation_df_left$y <- cluster_ys
+
+annotation_df_right <- umap_df %>% group_by(predicted.id) %>% tally() %>% mutate(predicted.id = factor(predicted.id, levels = rev(c('B cells', 'CD14 monocytes', 'CD16 monocytes', 'CD4 T cells', 'CD8 memory T cells', 'CD8 naive T cells', 'Dendritic cells', 'NK cells', 'NKT cells', 'Regulatory T cells')))) %>% arrange(predicted.id) %>% ungroup() %>% mutate(cumfreq = cumsum(n)) 
+
+cell_ys <- c()
+j <- 0
+for(i in 1:nrow(annotation_df_right)){
+  cell_ys <- c(cell_ys, (j + annotation_df_right$cumfreq[i])/2)
+  j <- j + annotation_df_right$n[i]
+}
+
+annotation_df_right$y <- cell_ys
+
+ggplot(as.data.frame(sank_df),
+       aes(y = n, axis1 = cluster, axis2 = predicted.id)) +
+    geom_alluvium(aes(fill = cluster), width = 1/12) +
+    geom_stratum(aes(fill = after_stat(stratum)), width = 1/12, color = "white") +
+    geom_text(data = annotation_df_left, aes(label = cluster, x = 0.95, y =y, axis1 = NULL, axis2 = NULL, fill = NULL), hjust = 1) +
+   geom_text(data = annotation_df_right, aes(label = predicted.id, x = 2.05, y =y, axis1 = NULL, axis2 = NULL, fill = NULL), hjust = 0) +
+   scale_fill_manual(values = c(cell_cols, cluster_cols)) +
+  theme_void() +
+  theme(legend.position = 'none') +
+  coord_cartesian(clip = 'off', xlim = c(0,3))
+```
+
+```{r}
+Idents(rna) <- rna$tissue 
+celltype_timepoint_degs <- data.frame()
+for(i in unique(rna$cell_type)){
+  tryCatch({
+    sub <- rna[,rna$cell_type == i]
+    degs <- FindMarkers(sub, ident.1 = 'kidney', ident.2 = 'tumor') %>% rownames_to_column(var = 'gene') %>% mutate(celltype = i)
+    celltype_timepoint_degs <- rbind(celltype_timepoint_degs, degs)
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+
+daps <- data.frame()
+Idents(atac) <- atac$sampletype
+for(i in levels(atac$predicted.id)){
+  sub <- atac[,atac$predicted.id == i]
+  tryCatch({
+  adj_rcc <- FindMarkers(sub, ident.1 = 'adjNorm', ident.2 = 'RCC')
+  adj_rcc$gene <- rownames(adj_rcc)
+  adj_rcc$cell_type <- i
+  adj_rcc$compar <- 'adjNorm vs. RCC'
+  daps <- rbind(daps, adj_rcc)}, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+
+daps$adj_p <- p.adjust(daps$p_val, method = 'fdr')
+top_daps <- daps %>% filter(abs(avg_log2FC) >= 0.5, adj_p <= 0.05)
+
+DefaultAssay(atac) <- 'peaks'
+dap_genes <- ClosestFeature(atac, regions = top_daps$gene)
+
+top_daps <- top_daps %>% left_join(dap_genes, by = c('gene' = 'query_region'))
+
+ggplot(top_daps %>% group_by(cell_type) %>% slice_min(order_by = adj_p, n = 50) %>% slice_max(order_by = abs(avg_log2FC), n = 5), aes(x = -log10(adj_p), y = gene_name)) +
+  geom_point() +
+  facet_wrap(~cell_type, scales = 'free')
+
+atac$celltype_timepoint <- factor(paste0(atac$predicted.id, '.', atac$sampletype))
+Idents(atac) <- atac$celltype_timepoint
+
+spec_peaks <- CallPeaks(
+  object = atac,
+  group.by = "celltype_timepoint",
+  macs2.path = '/home/sarah/anaconda3/bin/macs3'
+)
+
+blacklist <- read.csv('hg38.blacklist.bed.gz', sep='\t', header = F)
+for(i in 1:nrow(blacklist)){
+  spec_peaks <- spec_peaks[!(seqnames(spec_peaks) == blacklist$V1[i] & spec_peaks@ranges@start >= blacklist$V2[i] & (spec_peaks@ranges@start + spec_peaks@ranges@width) <= blacklist$V3[i]), ]
+}
+
+spec_peaks <- as.data.frame(spec_peaks)
+spec_peaks <- spec_peaks %>% mutate(n_cells = str_count(peak_called_in, ',') + 1)
+
+cd8_spec <- spec_peaks %>% filter(str_detect(peak_called_in, 'CD8_memory_T_cells'), str_count(peak_called_in, ',') == 0)
+
+cd8_spec_genes <- ClosestFeature(atac, regions = paste0(cd8_spec$seqnames, '-', cd8_spec$start, '-', cd8_spec$end))
+
+cd8_spec <- cd8_spec %>% mutate(query_region = paste0(seqnames, '-', start, '-', end)) %>% left_join(cd8_spec_genes, by = 'query_region')
+
+DefaultAssay(atac) <- 'peaks'
+atac$sampletype <- factor(atac$sampletype, levels = c('adjNorm', 'RCC'))
+Idents(atac) <- atac$sampletype
+
+p1 <- CoveragePlot(atac[,atac$predicted.id == 'CD8 memory T cells'], region = c('chr2-203869000-203870500'), extend.downstream = 100, extend.upstream = 50, peaks = F) &
+  scale_fill_manual(values = tissue_cols) & theme(axis.title = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), strip.text.y.left = element_text(colour = 'black', size = 12))
+p2 <- CoveragePlot(atac[,atac$predicted.id == 'CD8 memory T cells'], region = c('chr11-111540000-111545000'), extend.downstream = 100, extend.upstream = 50, peaks = F) &
+  scale_fill_manual(values = tissue_cols) & theme(axis.title = element_blank(), strip.text.y.left = element_blank(),strip.background = element_blank(), axis.line.x = element_blank(), axis.ticks = element_blank(), axis.text.x = element_blank())
+p3 <- CoveragePlot(atac[,atac$predicted.id == 'CD8 memory T cells'], region = c('chr8-58915000-58935000'), extend.downstream = 100, extend.upstream = 50, peaks = F) &
+  scale_fill_manual(values = tissue_cols) & theme(axis.title = element_blank(), strip.text.y.left = element_blank(),strip.background = element_blank(), axis.line.x = element_blank(), axis.ticks = element_blank(), axis.text.x = element_blank())
+atac_plot <- p1 + p2 + p3
+```
+
+```{r}
+dys_genes <- as.data.frame(t(as.matrix(rna@assays$RNA[c('CTLA4', 'TOX', 'LAYN'), rna$cell_type == 'CD8 memory T cells'])))
+dys_genes$tissue <- rna$tissue[rna$cell_type == 'CD8 memory T cells']
+
+dys_genes <- dys_genes %>% pivot_longer(-tissue, names_to = 'gene', values_to = 'value')
+
+ggplot(dys_genes, aes(x = tissue, y = value, fill = tissue)) +
+  geom_violin(scale='area', position = position_dodge(width = 2), show.legend = F) +
+  geom_jitter(position = position_jitter(width = 0.35), size = 0.5, alpha = 0.4, col = 'grey20', show.legend = F) +
+  scale_x_discrete(limits = c('kidney', 'tumor'), labels = c('adjNorm', 'RCC')) +
+  scale_fill_manual(values = unname(tissue_cols), breaks = c('tumor', 'kidney')) +
+  facet_wrap(~gene, scales = 'free_x') +
+  theme_classic(base_size = 14) +
+  theme(axis.text = element_text(colour = 'black'),
+        axis.title = element_blank())
+
+```
+
+
+```{r}
+atac_plot/rna_plot + plot_layout(heights = c(1.8, 0.5))
+```
